@@ -7,11 +7,11 @@ Our entry to the [COMFORT Localization Benchmark](https://grand-tour.leggedrobot
 
 <table align="center">
   <tr>
-    <td align="center"><a href="https://youtu.be/KeFDiszek7g"><img src="pictures/comfort-test6.gif" alt="Real-time run on the six Test missions (click for the full video)" /></a></td>
+    <td align="center"><a href="https://youtu.be/6d9qwjqTFwc"><img src="pictures/comfort-test6.gif" alt="Method overview and full runs on the six Test missions (click for the full video)" /></a></td>
     <td align="center"><a href="https://youtu.be/2fzHPVpcxvc"><img src="pictures/arc2-adaptive.gif" alt="Adaptive downsampling on ARC-2 (click for the full video)" /></a></td>
   </tr>
   <tr>
-    <td align="center"><sub><a href="https://youtu.be/KeFDiszek7g">▶ Real-time run on the six Test missions</a></sub></td>
+    <td align="center"><sub><a href="https://youtu.be/6d9qwjqTFwc">▶ Method overview and full runs on the six Test missions</a></sub></td>
     <td align="center"><sub><a href="https://youtu.be/2fzHPVpcxvc">▶ Adaptive downsampling on ARC-2</a></sub></td>
   </tr>
 </table>

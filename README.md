@@ -4,6 +4,7 @@ Our entry to the [COMFORT Localization Benchmark](https://grand-tour.leggedrobot
 ([GrandTour Dataset](https://grand-tour.leggedrobotics.com/), [IROS 2026 Data in Field Robotics workshop](https://jonasfrey96.github.io/data_in_field_robotics/)).
 
 **SE(3)-LIVOM: Adaptive Multi-LiDAR-Inertial-Visual Odometry and Mapping for the COMFORT Benchmark**
+([technical report, PDF](docs/SE3-LIVOM_report.pdf))
 
 <table align="center">
   <tr>

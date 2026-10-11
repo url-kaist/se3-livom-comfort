@@ -3,6 +3,7 @@
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/navigation/AttitudeFactor.h>
 #include <gtsam/nonlinear/ISAM2.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/slam/BetweenFactor.h>
@@ -21,6 +22,9 @@
 #include <unistd.h>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
+
+#include <pcl/kdtree/kdtree_flann.h>
 
 // ba.hpp / tools.hpp define globals (thd_num, layer_limit, ...): include them from this TU only.
 #include "backend/ba.hpp"
@@ -185,6 +189,122 @@ gtsam::NonlinearFactor::shared_ptr between(size_t a, size_t b, const mypcl::pose
         a, b, gtsam::Pose3(gtsam::Rot3(R_ab), gtsam::Point3(t_ab)), gtsam::noiseModel::Diagonal::Variances(v)));
 }
 
+// Loop ICP constants (pgo_hba.py): normal estimation, information scale, submap range and the acceptance gates
+constexpr int NEIGHBORS = 16, N_MIN = 500;
+constexpr double N_EFF = 100.0, RANGE = 40.0, SUBMAP_VOXEL = 0.2;
+constexpr double RMS_MAX = 0.06, MATCH_MIN = 0.15, INLIER_MIN = 0.7, DT_MAX = 1.0, DR_MAX = 10.0;
+
+inline Eigen::Vector3d vec(const PointType &p) { return Eigen::Vector3d(p.x, p.y, p.z); }
+
+// Target cloud with a kd-tree and per-point plane normals (16 nearest neighbours within 1 m, eigenvalue ratio < 0.1)
+struct Target {
+    Cloud::Ptr pts;
+    pcl::KdTreeFLANN<PointType> tree;
+    vector<Eigen::Vector3d> normal;
+    vector<uint8_t> good;
+    explicit Target(Cloud::Ptr c) : pts(c) {
+        int n = pts->points.size();
+        normal.assign(n, Eigen::Vector3d::Zero());
+        good.assign(n, 0);
+        if (n < NEIGHBORS) return;
+        tree.setInputCloud(pts);
+        vector<int> idx(NEIGHBORS);
+        vector<float> d2(NEIGHBORS);
+        for (int i = 0; i < n; i++) {
+            if (tree.nearestKSearch(pts->points[i], NEIGHBORS, idx, d2) < NEIGHBORS) continue;
+            Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+            for (int j : idx) mean += vec(pts->points[j]);
+            mean /= NEIGHBORS;
+            Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+            for (int j : idx) {
+                Eigen::Vector3d d = vec(pts->points[j]) - mean;
+                cov += d * d.transpose();
+            }
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov / NEIGHBORS);
+            normal[i] = es.eigenvectors().col(0);
+            good[i] = d2.back() < 1.0 && es.eigenvalues()[0] / std::max(es.eigenvalues()[1], 1e-12) < 0.1;
+        }
+    }
+};
+
+// Point-to-plane ICP of src onto tgt from T (source frame in the target frame); correspondences within `coarse` m for
+// the first 10 iterations and 0.4 m afterwards, residuals over 0.1 m down-weighted. Information = J'J / n * N_EFF / rms^2.
+IcpResult icp(const Cloud &src, const Target &tgt, Eigen::Matrix4d T, int iters, double coarse) {
+    typedef Eigen::Matrix<double, 6, 6> M6;
+    int ns = src.points.size();
+    vector<int> idx(1);
+    vector<float> d2(1);
+    auto nearest = [&](const Eigen::Vector3d &s, double bound) {
+        PointType q;
+        q.x = s.x(), q.y = s.y(), q.z = s.z();
+        if (tgt.good.empty() || tgt.tree.nearestKSearch(q, 1, idx, d2) < 1 || d2[0] > bound * bound || !tgt.good[idx[0]]) return -1;
+        return idx[0];
+    };
+    int it = 0;
+    for (; it < iters; it++) {
+        Eigen::Matrix3d R = T.block<3, 3>(0, 0);
+        Eigen::Vector3d t = T.block<3, 1>(0, 3);
+        M6 H = M6::Zero();
+        VEC(6) g = VEC(6)::Zero();
+        for (int i = 0; i < ns; i++) {
+            Eigen::Vector3d s = R * vec(src.points[i]) + t;
+            int j = nearest(s, it < 10 ? coarse : 0.4);
+            if (j < 0) continue;
+            const Eigen::Vector3d &nrm = tgt.normal[j];
+            double r = (s - vec(tgt.pts->points[j])).dot(nrm);
+            double w = fabs(r) < 0.1 ? 1.0 : 0.1 / std::max(fabs(r), 1e-9);
+            VEC(6) J;
+            J << s.cross(nrm), nrm;
+            H += w * J * J.transpose();
+            g += w * J * r;
+        }
+        VEC(6) x = (H + 1e-9 * M6::Identity()).ldlt().solve(-g);
+        Eigen::Matrix4d dT = Eigen::Matrix4d::Identity();
+        double a = x.head<3>().norm();
+        if (a > 0) dT.block<3, 3>(0, 0) = Eigen::AngleAxisd(a, x.head<3>() / a).toRotationMatrix();
+        dT.block<3, 1>(0, 3) = x.tail<3>();
+        T = dT * T;
+        if (a < 1e-5 && x.tail<3>().norm() < 1e-4) break;
+    }
+    IcpResult out;
+    out.T = T;
+    out.iters = std::min(it + 1, iters);
+    Eigen::Matrix3d R = T.block<3, 3>(0, 0);
+    Eigen::Vector3d t = T.block<3, 1>(0, 3);
+    int matched = 0, ninl = 0;
+    double sq = 0;
+    M6 JJ = M6::Zero();
+    for (int i = 0; i < ns; i++) {
+        Eigen::Vector3d s = R * vec(src.points[i]) + t;
+        int j = nearest(s, 0.4);
+        if (j < 0) continue;
+        matched++;
+        const Eigen::Vector3d &nrm = tgt.normal[j];
+        double r = (s - vec(tgt.pts->points[j])).dot(nrm);
+        if (fabs(r) >= 0.1) continue;
+        ninl++;
+        sq += r * r;
+        VEC(6) J;
+        J << s.cross(nrm), nrm;
+        JJ += J * J.transpose();
+    }
+    out.rms = ninl ? std::sqrt(sq / ninl) : INFINITY;
+    out.matched = ns ? double(matched) / ns : 0.0;
+    out.inlier = matched ? double(ninl) / matched : 0.0;
+    out.n = ninl;
+    out.info = JJ / std::max(ninl, 1) * N_EFF / std::pow(std::max(out.rms, 0.01), 2);
+    return out;
+}
+
+// surfel_native.cpp robust_information: sqrt-information from the eigen decomposition (rank deficiency allowed) under Huber
+gtsam::SharedNoiseModel robust_information(const Eigen::Matrix<double, 6, 6> &info, double huber) {
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> e((info + info.transpose()) * 0.5);
+    Eigen::Matrix<double, 6, 6> S = e.eigenvalues().cwiseMax(0).cwiseSqrt().asDiagonal() * e.eigenvectors().transpose();
+    gtsam::SharedNoiseModel g = gtsam::noiseModel::Gaussian::SqrtInformation(S, false);
+    if (huber <= 0) return g;
+    return gtsam::noiseModel::Robust::Create(gtsam::noiseModel::mEstimator::Huber::Create(huber), g);
+}
+
 // Window i of a layer (frames i*GAP .. +WIN_SIZE) merged in the first frame's coordinates with the input poses
 // (hba.cpp parallel_comp without the window BA), then 0.05 m downsampled as HBA does.
 Cloud::Ptr merge_window(const vector<mypcl::pose> &poses, const vector<Cloud::Ptr> &src, int i) {
@@ -205,6 +325,16 @@ Cloud::Ptr merge_window(const vector<mypcl::pose> &poses, const vector<Cloud::Pt
 }
 
 }  // namespace
+
+IcpResult loop_icp(const float *src, int ns, const float *tgt, int nt, const Eigen::Matrix4d &T0, int iters, double coarse) {
+    Cloud::Ptr s(new Cloud), t(new Cloud);
+    s->points.resize(ns);
+    for (int i = 0; i < ns; i++) s->points[i].x = src[3 * i], s->points[i].y = src[3 * i + 1], s->points[i].z = src[3 * i + 2];
+    t->points.resize(nt);
+    for (int i = 0; i < nt; i++) t->points[i].x = tgt[3 * i], t->points[i].y = tgt[3 * i + 1], t->points[i].z = tgt[3 * i + 2];
+    Target target(t);
+    return icp(*s, target, T0, iters, coarse);
+}
 
 struct OnlineBackend::Impl {
     Params prm;
@@ -242,6 +372,15 @@ struct OnlineBackend::Impl {
     int solved = 0;  // top keyframes covered by the last applied round
     std::vector<RoundStat> stats;
     double pending_ms = 0;
+
+    // loop closure over top keyframes: a small graph of the LIO chain plus the accepted loops gives the proximity search
+    // its positions and each round its BA initial (the offline loop PGO); node k = top keyframe k = scan k * stride
+    gtsam::NonlinearFactorGraph lgraph;
+    gtsam::Values lvalues;
+    bool ldirty = false;      // lvalues behind lgraph
+    int loop_next = 0;        // next top keyframe to search
+    std::unordered_set<int> loop_targets;
+    std::atomic<int> loops_accepted{0};
 
     // scan queue and the worker
     std::mutex mu;
@@ -347,6 +486,87 @@ struct OnlineBackend::Impl {
         values.clear();
     }
 
+    // Top keyframe k joins the loop graph: chain factor from the LIO relative motion (1 deg, 5 cm, Huber 3)
+    void loop_add(int k) {
+        const vector<mypcl::pose> &top = kposes.back();
+        if (k == 0) {
+            lvalues.insert(0, P3(top[0]));
+            lgraph.add(gtsam::PriorFactor<gtsam::Pose3>(0, P3(top[0]), gtsam::noiseModel::Isotropic::Sigma(6, 1e-6)));
+            return;
+        }
+        gtsam::Pose3 rel = P3(top[k - 1]).between(P3(top[k]));
+        lvalues.insert(k, lvalues.at<gtsam::Pose3>(k - 1).compose(rel));
+        gtsam::Vector s(6);
+        s << 0.01745, 0.01745, 0.01745, 0.05, 0.05, 0.05;
+        lgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(k - 1, k, rel, gtsam::noiseModel::Robust::Create(gtsam::noiseModel::mEstimator::Huber::Create(3.0), gtsam::noiseModel::Diagonal::Sigmas(s))));
+    }
+
+    void loop_solve() {
+        if (!ldirty) return;
+        lvalues = gtsam::LevenbergMarquardtOptimizer(lgraph, lvalues).optimize();
+        ldirty = false;
+    }
+
+    // Top keyframes k-1 .. k+1 in k's frame (LIO relative motion), within RANGE m, at SUBMAP_VOXEL
+    Cloud::Ptr submap(int k) {
+        const vector<mypcl::pose> &top = kposes.back();
+        const vector<Cloud::Ptr> &kf = pcds.back();
+        Cloud::Ptr out(new Cloud);
+        for (int m = std::max(0, k - 1); m <= std::min((int)kf.size() - 1, k + 1); m++) {
+            Eigen::Quaterniond q;
+            Eigen::Vector3d t;
+            assign_qt(q, t, top[k].q.inverse() * top[m].q, top[k].q.inverse() * (top[m].t - top[k].t));
+            Cloud one;
+            mypcl::transform_pointcloud(*kf[m], one, t, q);
+            for (const PointType &p : one.points)
+                if (p.x * p.x + p.y * p.y + p.z * p.z < RANGE * RANGE) out->points.push_back(p);
+        }
+        downsample_voxel(*out, SUBMAP_VOXEL);
+        return out;
+    }
+
+    // pgo_hba.py propose + refine for every top keyframe not yet searched: the nearest earlier keyframe >= loop_gap s
+    // back within loop_radius m (positions from the loop graph), ICP from their relative pose, gates, factor.
+    void detect_loops() {
+        const vector<mypcl::pose> &top = kposes.back();
+        for (int n = top.size(); loop_next < n; loop_next++) {
+            int j = loop_next;
+            loop_solve();
+            auto pose = [&](int k) { return loops_accepted ? lvalues.at<gtsam::Pose3>(k) : P3(top[k]); };
+            Eigen::Vector3d pj = pose(j).translation();
+            double tj = imu[j * stride].stamp;
+            int i = -1;
+            double best = prm.loop_radius;
+            for (int k = 0; k < j; k++) {
+                if (tj - imu[k * stride].stamp < prm.loop_gap || loop_targets.count(k)) continue;
+                double d = (pose(k).translation() - pj).norm();
+                if (d <= best) best = d, i = k;
+            }
+            if (i < 0) continue;
+            Eigen::Matrix4d T0 = pose(i).between(pose(j)).matrix();
+            double t0 = now_sec();
+            Target target(submap(i));
+            Cloud::Ptr source = submap(j);
+            IcpResult r = icp(*source, target, T0, 40, 1.0);
+            Eigen::Matrix4d dd = T0.inverse() * r.T;
+            double dt = dd.block<3, 1>(0, 3).norm();
+            double dr = Eigen::AngleAxisd(Eigen::Matrix3d(dd.block<3, 3>(0, 0))).angle() * 180 / M_PI;
+            bool ok = r.rms < RMS_MAX && r.matched > MATCH_MIN && r.n >= N_MIN && r.inlier > INLIER_MIN && dt < DT_MAX && dr < DR_MAX;
+            fprintf(stderr, "LOOP kf %d %d scans %d %d dist %.2f rms %.3f matched %.2f inlier %.2f n %d dt %.3f dr %.2f iters %d %.2fs %s\n", i, j, i * stride,
+                    j * stride, best, r.rms, r.matched, r.inlier, r.n, dt, dr, r.iters, now_sec() - t0, ok ? "accepted" : "rejected");
+            if (!ok) continue;
+            gtsam::SharedNoiseModel model = robust_information(r.info, prm.loop_huber);
+            lgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(i, j, gtsam::Pose3(r.T), model));
+            ldirty = true;
+            graph.add(gtsam::BetweenFactor<gtsam::Pose3>((size_t)i * stride, (size_t)j * stride, gtsam::Pose3(r.T), model));
+            isam.update(graph, values);
+            graph.resize(0);
+            values.clear();
+            loop_targets.insert(i);
+            loops_accepted++;
+        }
+    }
+
     // Every full window whose frames have arrived, layer by layer; frames no window still needs are freed.
     void advance() {
         int L = prm.layers;
@@ -361,6 +581,7 @@ struct OnlineBackend::Impl {
                 pcds[l + 1].push_back(kf);
                 kposes[l + 1].push_back(kposes[l][i * GAP]);
                 if (l == 0) window_factors(i);
+                if (l + 1 == L - 1) loop_add(kposes[l + 1].size() - 1);
             }
             for (int j = freed[l]; j < next_win[l] * GAP; j++, freed[l]++) pcds[l][j].reset();
         }
@@ -371,6 +592,14 @@ struct OnlineBackend::Impl {
         const vector<mypcl::pose> &top = kposes.back();
         int n = top.size(), start = pushed.load();
         vector<mypcl::pose> x(top.begin(), top.begin() + n);
+        if (loops_accepted) {  // the LIO chain closed by the loops, as the offline PGO hands HBA its initial
+            loop_solve();
+            for (int i = 0; i < n; i++) {
+                gtsam::Pose3 P = lvalues.at<gtsam::Pose3>(i);
+                x[i].q = Eigen::Quaterniond(P.rotation().matrix());
+                x[i].t = P.translation();
+            }
+        }
         PLV(6) hess;
         int iters;
         double rss_pre = rss_mb(), t0 = now_sec();
@@ -429,6 +658,7 @@ struct OnlineBackend::Impl {
                 imu.push_back(std::get<2>(e));
             }
             advance();
+            if (prm.loop_radius > 0) detect_loops();
             if (prm.gravity_sigma_deg > 0) detect_still();
             if (!stopping && (int)kposes.back().size() >= solved + prm.every) round();
         }
@@ -514,6 +744,7 @@ std::vector<Pose> OnlineBackend::finish() {
 
 const std::vector<RoundStat> &OnlineBackend::stats() const { return impl_->stats; }
 double OnlineBackend::pending_ms() const { return impl_->pending_ms; }
+int OnlineBackend::loops() const { return impl_->loops_accepted; }
 
 }  // namespace backend
 }  // namespace se3_lio

@@ -40,7 +40,8 @@ def main():
     ap.add_argument('--set', action='append', default=[], metavar='KEY=VAL', help='override an SE3LIOConfig field (voxel_map_plane_thres=1e-3; lists as lidar_range_noises=0.02,0.05)')
     ap.add_argument('--backend', nargs='?', const='', metavar='K=V,...', help='online backend: every `every` keyframes (25 scans each) a global plane BA over everything so far from the LIO poses, fed into an iSAM2 pose graph. '
                     'Nothing runs at the end; the estimate at that moment goes to <seq>_backend.tum, rounds to backend_rounds.csv. Values override _BackendParams'
-                    '(voxel_size=1.0,downsample_size=0.2,eigen_ratio=0.01,reject_ratio=0.05,max_iter=10,layers=3,threads=8,every=4,hess_const=a:b:c:d:e:f,gravity_sigma_deg=0.02). The gravity factor puts the accelerometer mean of a stationary chunk (speed < 2 cm/s over 2 s, 4 s long) on the stationary node, relative to the LIO bias and gravity direction (0 = off)')
+                    '(voxel_size=1.0,downsample_size=0.2,eigen_ratio=0.01,reject_ratio=0.05,max_iter=10,layers=3,threads=8,every=4,hess_const=a:b:c:d:e:f,gravity_sigma_deg=0.02,loop_radius=0,loop_gap=30,loop_huber=2.5). The gravity factor puts the accelerometer mean of a stationary chunk (speed < 2 cm/s over 2 s, 4 s long) on the stationary node, relative to the LIO bias and gravity direction (0 = off). '
+                    'loop_radius > 0 closes loops between top keyframes that revisit within that distance after loop_gap s (point-to-plane ICP, Huber factors); each round then starts from the loop-closed LIO chain')
     a = ap.parse_args()
 
     params = load_node_params(a.config)
@@ -115,7 +116,7 @@ def main():
         print(f'backend: rounds {len(st)} (used {len(used)}), kfs last {int(st[-1, 2]) if len(st) else 0}, ba s first/last '
               f'{st[0, 4] / 1e3 if len(st) else 0:.2f}/{st[-1, 4] / 1e3 if len(st) else 0:.2f}, pgo ms max {used[:, 5].max() if len(used) else 0:.0f}, '
               f'round gap scans med/max {np.median(gaps):.0f}/{gaps.max():.0f}, discarded wait {backend.pending_ms() / 1e3:.1f} s, '
-              f'rss GB at rounds first/last {st[0, 7] / 1024 if len(st) else 0:.1f}/{st[-1, 7] / 1024 if len(st) else 0:.1f}')
+              f'rss GB at rounds first/last {st[0, 7] / 1024 if len(st) else 0:.1f}/{st[-1, 7] / 1024 if len(st) else 0:.1f}, loops {backend.loops()}')
     if a.online_bag:   # delay = time the pose came out - time that image was taken (playback clock). Includes waiting for the LiDAR scan to end (<= 0.1 s)
         lag = np.array([dataset.lag(t, w) for t, w in zip(pipeline.stamps, pipeline.done)]) * 1e3
         np.savetxt(os.path.join(os.path.dirname(a.out), 'latency.csv'), np.c_[pipeline.stamps, lag], fmt=['%.9f', '%.3f'], delimiter=',', header='stamp,lag_ms', comments='')

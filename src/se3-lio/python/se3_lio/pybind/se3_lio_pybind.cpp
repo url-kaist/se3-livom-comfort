@@ -248,6 +248,7 @@ public:
     }
 
     double PendingMs() const { return backend_.pending_ms(); }
+    int Loops() const { return backend_.loops(); }
 
 private:
     se3_lio::backend::OnlineBackend backend_;
@@ -366,6 +367,9 @@ PYBIND11_MODULE(se3_lio_pybind, m) {
         .def_readwrite("every", &BackendParams::every)
         .def_readwrite("hess_const", &BackendParams::hess_const)
         .def_readwrite("gravity_sigma_deg", &BackendParams::gravity_sigma_deg)
+        .def_readwrite("loop_radius", &BackendParams::loop_radius)
+        .def_readwrite("loop_gap", &BackendParams::loop_gap)
+        .def_readwrite("loop_huber", &BackendParams::loop_huber)
         .def_readwrite("dump_dir", &BackendParams::dump_dir);
 
     py::class_<OnlineBackendWrapper>(m, "_OnlineBackend")
@@ -373,5 +377,16 @@ PYBIND11_MODULE(se3_lio_pybind, m) {
         .def("push", &OnlineBackendWrapper::Push, "q_xyzw"_a, "p"_a, "xyz"_a, "stamp"_a, "acc"_a, "ba"_a, "grav"_a)
         .def("finish", &OnlineBackendWrapper::Finish)
         .def("stats", &OnlineBackendWrapper::Stats)
-        .def("pending_ms", &OnlineBackendWrapper::PendingMs);
+        .def("pending_ms", &OnlineBackendWrapper::PendingMs)
+        .def("loops", &OnlineBackendWrapper::Loops);
+
+    // Loop ICP of the backend on two float32 (N, 3) clouds from T0 (source frame in the target frame): (T, info, stats)
+    m.def("_loop_icp", [](const py::array_t<float, py::array::c_style | py::array::forcecast> &src,
+                          const py::array_t<float, py::array::c_style | py::array::forcecast> &tgt, const Eigen::Matrix4d &T0) {
+        if (src.ndim() != 2 || src.shape(1) != 3 || tgt.ndim() != 2 || tgt.shape(1) != 3) throw std::invalid_argument("clouds must have shape (N, 3)");
+        se3_lio::backend::IcpResult r = se3_lio::backend::loop_icp(src.data(), src.shape(0), tgt.data(), tgt.shape(0), T0);
+        py::dict st;
+        st["rms"] = r.rms, st["matched"] = r.matched, st["inlier"] = r.inlier, st["n"] = r.n, st["iters"] = r.iters;
+        return py::make_tuple(r.T, r.info, st);
+    }, "src"_a, "tgt"_a, "T0"_a);
 }

@@ -1,4 +1,4 @@
-find_package(PCL REQUIRED COMPONENTS common)
+find_package(PCL REQUIRED COMPONENTS common kdtree)
 find_package(GTSAM REQUIRED)
 find_package(Threads REQUIRED)
 

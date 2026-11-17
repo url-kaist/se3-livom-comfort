@@ -1,5 +1,7 @@
 # SE(3)-LIVOM for the COMFORT Localization Benchmark
 
+🏆 **Overall winner of the [COMFORT Challenge](https://www.codabench.org/competitions/17505/) at IROS 2026.**
+
 Our entry to the [COMFORT Localization Benchmark](https://grand-tour.leggedrobotics.com/tasks/localization)
 ([GrandTour Dataset](https://grand-tour.leggedrobotics.com/), [IROS 2026 Data in Field Robotics workshop](https://jonasfrey96.github.io/data_in_field_robotics/)).
 
